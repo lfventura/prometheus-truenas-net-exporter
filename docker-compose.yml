@@ -1,0 +1,22 @@
+services:
+  truenas-net-exporter:
+    image: ghcr.io/lfventura/prometheus-truenas-net-exporter:latest
+    container_name: truenas_net_exporter
+    # Use the host PID namespace so we can read /proc/<PID>/root/sys for container mapping.
+    pid: host
+    privileged: true
+    ports:
+      - "9551:9551"
+    restart: unless-stopped
+    command:
+      - "--path.rootfs=/host"
+      - "--path.procfs=/host/proc"
+      - "--docker.socket=/host/var/run/docker.sock"
+      - "--web.listen-address=:9551"
+    volumes:
+      # Mount the entire host filesystem read-only.
+      - /:/host:ro,rslave
+      # Mount /dev for device access.
+      - /dev:/host/dev:ro
+      # Docker socket for container network mapping.
+      - /var/run/docker.sock:/host/var/run/docker.sock:ro

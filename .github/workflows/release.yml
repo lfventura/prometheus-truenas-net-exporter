@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: latest_tag
+        run: |
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate next version
+        id: next_version
+        run: |
+          CURRENT="${{ steps.latest_tag.outputs.tag }}"
+          # Strip 'v' prefix
+          VERSION="${CURRENT#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+          # Check commit messages since last tag for version bump hints
+          if [ "$CURRENT" = "v0.0.0" ]; then
+            COMMITS=$(git log --oneline)
+          else
+            COMMITS=$(git log "${CURRENT}..HEAD" --oneline)
+          fi
+
+          if echo "$COMMITS" | grep -qiE "^[a-f0-9]+ (feat|feature)(\(.+\))?!:"; then
+            # Breaking change → major bump
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif echo "$COMMITS" | grep -qiE "^[a-f0-9]+ feat(\(.+\))?:"; then
+            # New feature → minor bump
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            # Fix/chore/etc → patch bump
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEXT="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT"
+
+      - name: Check if release needed
+        id: check
+        run: |
+          CURRENT="${{ steps.latest_tag.outputs.tag }}"
+          NEXT="${{ steps.next_version.outputs.version }}"
+          if [ "$CURRENT" = "$NEXT" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No new commits since last release, skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate changelog
+        if: steps.check.outputs.skip != 'true'
+        id: changelog
+        run: |
+          CURRENT="${{ steps.latest_tag.outputs.tag }}"
+          if [ "$CURRENT" = "v0.0.0" ]; then
+            LOG=$(git log --oneline --pretty=format:"- %s (%h)" | head -50)
+          else
+            LOG=$(git log "${CURRENT}..HEAD" --oneline --pretty=format:"- %s (%h)")
+          fi
+          # Write to file to handle multiline
+          echo "$LOG" > /tmp/changelog.md
+          echo "Generated changelog for ${{ steps.next_version.outputs.version }}"
+
+      - name: Create tag
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.next_version.outputs.version }}" -m "Release ${{ steps.next_version.outputs.version }}"
+          git push origin "${{ steps.next_version.outputs.version }}"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.next_version.outputs.version }}
+          name: ${{ steps.next_version.outputs.version }}
+          body_path: /tmp/changelog.md
+          generate_release_notes: false
+
+      # Build and push Docker image with semver tags
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push versioned image
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.next_version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
