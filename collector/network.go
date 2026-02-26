@@ -256,6 +256,7 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 		case iface == "lo":
 			info.InstanceType = "loopback"
 			info.Instance = "loopback"
+			info.App = "system"
 
 		case strings.HasPrefix(iface, "veth"):
 			// Container veth — check Docker first, then Incus/LXC.
@@ -266,6 +267,7 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 			} else if incusName, ok := vethToIncus[iface]; ok {
 				info.InstanceType = "incus"
 				info.Instance = incusName
+				info.App = incusName
 			} else {
 				info.InstanceType = "docker"
 				info.Instance = iface
@@ -282,6 +284,7 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 			info.InstanceType = "vm"
 			if vmName, ok := vnetToVM[iface]; ok {
 				info.Instance = vmName
+				info.App = vmName
 			} else {
 				info.Instance = iface
 			}
@@ -290,6 +293,7 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 			info.InstanceType = "macvtap"
 			if vmName, ok := vnetToVM[iface]; ok {
 				info.Instance = vmName
+				info.App = vmName
 			} else {
 				info.Instance = iface
 			}
@@ -297,6 +301,7 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 		case strings.HasPrefix(iface, "vlan"):
 			info.InstanceType = "vlan"
 			info.Instance = iface
+			info.App = "system"
 
 		case strings.HasPrefix(iface, "br-") || strings.HasPrefix(iface, "br") ||
 			strings.HasPrefix(iface, "docker") || strings.HasPrefix(iface, "incus"):
@@ -312,6 +317,7 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 				}
 			} else {
 				info.Instance = iface
+				info.App = "system"
 			}
 
 		default:
@@ -323,6 +329,7 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 				info.InstanceType = "unknown"
 			}
 			info.Instance = iface
+			info.App = "system"
 		}
 
 		result[iface] = info
