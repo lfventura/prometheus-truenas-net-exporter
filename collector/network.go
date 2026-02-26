@@ -3,6 +3,7 @@ package collector
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -234,8 +235,8 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 	// Build ifindex → iface name map for the host.
 	ifindexMap := c.buildIfindexMap(stats, sysNetPath)
 
-	// Query Docker for container → veth mapping.
-	vethToContainer := c.buildDockerMapping(ifindexMap, sysNetPath)
+	// Query Docker for container → veth mapping and network → bridge mapping.
+	vethToContainer, bridgeToNetwork := c.fetchDockerData(ifindexMap)
 
 	// Query virsh for VM → vnet mapping.
 	vnetToVM := c.buildVMMapping()
@@ -255,13 +256,18 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 
 		case strings.HasPrefix(iface, "veth"):
 			// Docker container veth.
+			info.InstanceType = "docker"
 			if ci, ok := vethToContainer[iface]; ok {
-				info.InstanceType = "docker"
 				info.Instance = ci.Name
 				info.App = AppName(ci)
 			} else {
-				info.InstanceType = "docker"
 				info.Instance = iface
+				// Derive app from the parent bridge's Docker network.
+				if br, ok := bridgeMap[iface]; ok {
+					if netInfo, ok := bridgeToNetwork[br]; ok {
+						info.App = appNameFromDockerNetwork(netInfo.Name)
+					}
+				}
 			}
 
 		case strings.HasPrefix(iface, "vnet"):
@@ -288,7 +294,12 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 		case strings.HasPrefix(iface, "br-") || strings.HasPrefix(iface, "br") ||
 			strings.HasPrefix(iface, "docker") || strings.HasPrefix(iface, "incus"):
 			info.InstanceType = "bridge"
-			info.Instance = c.resolveBridgeName(iface, vethToContainer)
+			if netInfo, ok := bridgeToNetwork[iface]; ok {
+				info.Instance = netInfo.Name
+				info.App = appNameFromDockerNetwork(netInfo.Name)
+			} else {
+				info.Instance = iface
+			}
 
 		default:
 			// Check if it's a physical device (has a device/driver symlink in sysfs).
@@ -343,44 +354,50 @@ func (c *NetworkCollector) buildIfindexMap(stats map[string]interfaceStats, sysN
 	return m
 }
 
-// buildDockerMapping queries the Docker API and maps host-side veth interfaces
-// to their owning containers by correlating sysfs iflink values.
-func (c *NetworkCollector) buildDockerMapping(ifindexMap map[int]string, sysNetPath string) map[string]ContainerInfo {
-	result := make(map[string]ContainerInfo)
+// fetchDockerData queries the Docker API and returns:
+// 1. A mapping from host-side veth interfaces to their owning containers.
+// 2. A mapping from bridge interface names to their Docker network info.
+func (c *NetworkCollector) fetchDockerData(ifindexMap map[int]string) (map[string]ContainerInfo, map[string]DockerNetworkInfo) {
+	vethMap := make(map[string]ContainerInfo)
+	netMap := make(map[string]DockerNetworkInfo)
 
 	client := NewDockerClient(c.dockerSocket)
 	if !client.Available() {
-		c.logger.Debug("docker socket not available, skipping container mapping")
-		return result
+		c.logger.Debug("docker socket not available, skipping container/network mapping")
+		return vethMap, netMap
 	}
 
+	// Map containers to their host-side veth interfaces.
 	containers, err := client.ListContainers()
 	if err != nil {
 		c.logger.Warn("failed to list docker containers", "error", err)
-		return result
-	}
-
-	// For each container, find its host-side veth by reading the peer iflink
-	// from the container's network namespace via /proc/<PID>/root/sys.
-	for _, ci := range containers {
-		if ci.PID <= 0 {
-			continue
-		}
-
-		// Try to read iflink from the container's sysfs (via proc).
-		// Path: /proc/<PID>/root/sys/class/net/eth0/iflink
-		// In container mode: /host/proc/<PID>/root/sys/class/net/eth0/iflink
-		procRoot := c.opts.ProcPath
-		iflinks := c.findContainerIflinks(procRoot, ci.PID)
-
-		for _, hostIfindex := range iflinks {
-			if hostIface, ok := ifindexMap[hostIfindex]; ok {
-				result[hostIface] = ci
+	} else {
+		for _, ci := range containers {
+			if ci.PID <= 0 {
+				continue
+			}
+			iflinks := c.findContainerIflinks(c.opts.ProcPath, ci.PID)
+			for _, hostIfindex := range iflinks {
+				if hostIface, ok := ifindexMap[hostIfindex]; ok {
+					vethMap[hostIface] = ci
+				}
 			}
 		}
 	}
 
-	return result
+	// Map Docker bridge interfaces to their network names.
+	networks, err := client.ListNetworks()
+	if err != nil {
+		c.logger.Warn("failed to list docker networks", "error", err)
+	} else {
+		for _, n := range networks {
+			if n.BridgeName != "" {
+				netMap[n.BridgeName] = n
+			}
+		}
+	}
+
+	return vethMap, netMap
 }
 
 // findContainerIflinks reads the iflink values for all non-lo interfaces in a
@@ -408,18 +425,35 @@ func (c *NetworkCollector) findContainerIflinks(procPath string, pid int) []int 
 	return iflinks
 }
 
-// buildVMMapping uses virsh (if available) to map vnet/macvtap interfaces to VM names.
+// buildVMMapping maps vnet/macvtap interfaces to VM names.
+// It first tries the TrueNAS midclt API, then falls back to virsh.
 func (c *NetworkCollector) buildVMMapping() map[string]string {
 	result := make(map[string]string)
 
-	// Get list of running VMs.
+	// Try TrueNAS midclt API first (works on TrueNAS SCALE where virsh is unavailable).
+	if vms, err := c.queryMidcltVMs(); err == nil && len(vms) > 0 {
+		for _, vm := range vms {
+			if vm.pid <= 0 {
+				continue
+			}
+			ifaces := c.findQEMUInterfaces(vm.pid)
+			for _, iface := range ifaces {
+				result[iface] = vm.name
+			}
+		}
+		if len(result) > 0 {
+			c.logger.Debug("mapped VMs via midclt", "count", len(result))
+			return result
+		}
+	}
+
+	// Fall back to virsh.
 	vmNames, err := c.runVirshListNames()
 	if err != nil {
-		c.logger.Debug("virsh not available, skipping VM mapping", "error", err)
+		c.logger.Debug("vm mapping not available (neither midclt nor virsh)", "error", err)
 		return result
 	}
 
-	// For each VM, get its network interfaces.
 	for _, vmName := range vmNames {
 		ifaces, err := c.runVirshDomIfList(vmName)
 		if err != nil {
@@ -432,6 +466,114 @@ func (c *NetworkCollector) buildVMMapping() map[string]string {
 	}
 
 	return result
+}
+
+// vmEntry holds a running VM's name and QEMU PID.
+type vmEntry struct {
+	name string
+	pid  int
+}
+
+// queryMidcltVMs queries the TrueNAS middleware for running VMs.
+func (c *NetworkCollector) queryMidcltVMs() ([]vmEntry, error) {
+	cmd := c.buildCommand("midclt", "call", "vm.query")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = nil
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	var raw []struct {
+		Name   string `json:"name"`
+		Status struct {
+			State string `json:"state"`
+			PID   int    `json:"pid"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &raw); err != nil {
+		return nil, fmt.Errorf("midclt unmarshal: %w", err)
+	}
+
+	var vms []vmEntry
+	for _, r := range raw {
+		if r.Status.State == "RUNNING" && r.Status.PID > 0 {
+			vms = append(vms, vmEntry{name: r.Name, pid: r.Status.PID})
+		}
+	}
+	return vms, nil
+}
+
+// findQEMUInterfaces scans /proc/<PID>/fd and fdinfo to discover
+// the tap/macvtap interfaces owned by a QEMU process.
+// - tap devices: /dev/net/tun FDs with "iff: vnetX" in fdinfo
+// - macvtap devices: /dev/tapN FDs where N is the ifindex
+func (c *NetworkCollector) findQEMUInterfaces(pid int) []string {
+	fdDir := filepath.Join(c.opts.ProcPath, strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		c.logger.Debug("cannot read QEMU fd dir", "pid", pid, "error", err)
+		return nil
+	}
+
+	var ifaces []string
+	for _, entry := range entries {
+		fdPath := filepath.Join(fdDir, entry.Name())
+		target, err := os.Readlink(fdPath)
+		if err != nil {
+			continue
+		}
+
+		switch {
+		case target == "/dev/net/tun":
+			// Read fdinfo for the interface name ("iff:\tvnetX").
+			fdinfoPath := filepath.Join(c.opts.ProcPath, strconv.Itoa(pid), "fdinfo", entry.Name())
+			if ifName := readFdinfoIff(fdinfoPath); ifName != "" {
+				ifaces = append(ifaces, ifName)
+			}
+
+		case strings.HasPrefix(target, "/dev/tap"):
+			// macvtap: /dev/tapN where N = ifindex of the macvtap interface.
+			idxStr := strings.TrimPrefix(target, "/dev/tap")
+			if idx, err := strconv.Atoi(idxStr); err == nil {
+				if ifName := c.resolveIfindex(idx); ifName != "" {
+					ifaces = append(ifaces, ifName)
+				}
+			}
+		}
+	}
+	return ifaces
+}
+
+// readFdinfoIff reads the "iff:" line from a /proc/<PID>/fdinfo/<FD> file.
+// Returns the interface name (e.g. "vnet0") or empty string.
+func readFdinfoIff(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "iff:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "iff:"))
+		}
+	}
+	return ""
+}
+
+// resolveIfindex finds the interface name for a given ifindex by scanning sysfs.
+func (c *NetworkCollector) resolveIfindex(idx int) string {
+	sysNetPath := c.sysClassNetPath()
+	entries, err := os.ReadDir(sysNetPath)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		idxStr := readFileString(filepath.Join(sysNetPath, entry.Name(), "ifindex"))
+		if ifidx, err := strconv.Atoi(idxStr); err == nil && ifidx == idx {
+			return entry.Name()
+		}
+	}
+	return ""
 }
 
 // runVirshListNames returns the names of all running VMs.
@@ -477,9 +619,6 @@ func (c *NetworkCollector) runVirshDomIfList(vmName string) ([]string, error) {
 		fields := strings.Fields(line)
 		if len(fields) >= 1 {
 			ifName := fields[0]
-			// virsh domiflist shows: Interface Type Source Model MAC
-			// e.g.: vnet0 bridge br0 virtio 52:54:00:...
-			// or:   macvtap0 direct enp8s0f0 virtio 00:a1:98:...
 			if ifName != "" && ifName != "-" {
 				ifaces = append(ifaces, ifName)
 			}
@@ -488,25 +627,17 @@ func (c *NetworkCollector) runVirshDomIfList(vmName string) ([]string, error) {
 	return ifaces, nil
 }
 
-// resolveBridgeName tries to give a Docker bridge a friendlier name by
-// looking up the Docker network name associated with it.
-func (c *NetworkCollector) resolveBridgeName(bridgeIface string, vethMap map[string]ContainerInfo) string {
-	// Docker custom networks use bridges named "br-<12char hash>".
-	// Try to find a container whose network maps to this bridge.
-	if !strings.HasPrefix(bridgeIface, "br-") {
-		return bridgeIface
+// appNameFromDockerNetwork extracts a TrueNAS app name from a Docker
+// network name. TrueNAS apps create networks named "ix-<appname>_<suffix>".
+func appNameFromDockerNetwork(networkName string) string {
+	if !strings.HasPrefix(networkName, "ix-") {
+		return ""
 	}
-	bridgeHash := strings.TrimPrefix(bridgeIface, "br-")
-
-	for _, ci := range vethMap {
-		for netName, net := range ci.Networks {
-			if strings.HasPrefix(net.NetworkID, bridgeHash) {
-				// Use the Docker network name as a friendlier label.
-				return netName
-			}
-		}
+	name := strings.TrimPrefix(networkName, "ix-")
+	if idx := strings.Index(name, "_"); idx > 0 {
+		return name[:idx]
 	}
-	return bridgeIface
+	return name
 }
 
 // buildCommand creates an exec.Cmd that optionally uses chroot for container mode.

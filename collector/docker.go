@@ -203,3 +203,59 @@ type dockerEndpoint struct {
 	MacAddress string
 	IPAddress  string
 }
+
+// DockerNetworkInfo holds information about a Docker network.
+type DockerNetworkInfo struct {
+	ID         string
+	Name       string
+	Driver     string
+	BridgeName string // host bridge interface name (e.g., "br-2c852816592c" or "docker0")
+}
+
+// ListNetworks returns information about all Docker bridge networks.
+func (c *DockerClient) ListNetworks() ([]DockerNetworkInfo, error) {
+	resp, err := c.httpClient.Get("http://localhost/networks")
+	if err != nil {
+		return nil, fmt.Errorf("docker list networks: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("docker read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("docker API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var raw []dockerNetworkListEntry
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("docker unmarshal networks: %w", err)
+	}
+
+	var result []DockerNetworkInfo
+	for _, n := range raw {
+		if n.Driver != "bridge" {
+			continue
+		}
+		info := DockerNetworkInfo{
+			ID:     n.ID,
+			Name:   n.Name,
+			Driver: n.Driver,
+		}
+		if name, ok := n.Options["com.docker.network.bridge.name"]; ok {
+			info.BridgeName = name
+		} else if len(n.ID) >= 12 {
+			info.BridgeName = "br-" + n.ID[:12]
+		}
+		result = append(result, info)
+	}
+	return result, nil
+}
+
+type dockerNetworkListEntry struct {
+	ID      string            `json:"Id"`
+	Name    string            `json:"Name"`
+	Driver  string            `json:"Driver"`
+	Options map[string]string `json:"Options"`
+}
