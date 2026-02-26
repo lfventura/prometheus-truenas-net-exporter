@@ -120,12 +120,14 @@ func (c *NetworkCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect implements prometheus.Collector.
 func (c *NetworkCollector) Collect(ch chan<- prometheus.Metric) {
-	// 1. Read interface stats from /proc/net/dev.
+	// 1. Read interface stats from /proc/1/net/dev (host network namespace).
 	stats, err := c.readProcNetDev()
 	if err != nil {
-		c.logger.Error("failed to read /proc/net/dev", "error", err)
+		c.logger.Error("failed to read /proc/1/net/dev", "error", err)
 		return
 	}
+
+	c.logger.Debug("collected interface stats", "count", len(stats))
 
 	// 2. Build interface → metadata mapping.
 	infoMap := c.buildInterfaceInfo(stats)
@@ -151,8 +153,12 @@ func (c *NetworkCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 // readProcNetDev parses /proc/net/dev and returns counters per interface.
+// Note: /proc/net is a symlink to /proc/self/net which resolves to the
+// current process's network namespace. In a container, this would show
+// only the container's interfaces. We use /proc/1/net/dev instead, as
+// PID 1 (host init) is always in the host's network namespace.
 func (c *NetworkCollector) readProcNetDev() (map[string]interfaceStats, error) {
-	path := filepath.Join(c.opts.ProcPath, "net", "dev")
+	path := filepath.Join(c.opts.ProcPath, "1", "net", "dev")
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
