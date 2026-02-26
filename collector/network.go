@@ -238,7 +238,10 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 	// Query Docker for container → veth mapping and network → bridge mapping.
 	vethToContainer, bridgeToNetwork := c.fetchDockerData(ifindexMap)
 
-	// Query virsh for VM → vnet mapping.
+	// Query Incus/LXC for container → veth mapping.
+	vethToIncus := c.buildIncusMapping(ifindexMap)
+
+	// Query midclt/virsh for VM → vnet mapping.
 	vnetToVM := c.buildVMMapping()
 
 	result := make(map[string]interfaceInfo)
@@ -255,12 +258,16 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 			info.Instance = "loopback"
 
 		case strings.HasPrefix(iface, "veth"):
-			// Docker container veth.
-			info.InstanceType = "docker"
+			// Container veth — check Docker first, then Incus/LXC.
 			if ci, ok := vethToContainer[iface]; ok {
+				info.InstanceType = "docker"
 				info.Instance = ci.Name
 				info.App = AppName(ci)
+			} else if incusName, ok := vethToIncus[iface]; ok {
+				info.InstanceType = "incus"
+				info.Instance = incusName
 			} else {
+				info.InstanceType = "docker"
 				info.Instance = iface
 				// Derive app from the parent bridge's Docker network.
 				if br, ok := bridgeMap[iface]; ok {
@@ -644,6 +651,98 @@ func appNameFromDockerNetwork(networkName string) string {
 		return name[:idx]
 	}
 	return name
+}
+
+// buildIncusMapping discovers Incus/LXC containers by scanning /proc for
+// processes in LXC cgroups and maps their host-side veth interfaces.
+//
+// LXC containers have a cgroup path like:
+//
+//	0::/lxc.payload.<containername>/init.scope
+//
+// We look for init processes (the ones with /init.scope) and use the same
+// iflink technique as Docker to find their host-side veth interfaces.
+func (c *NetworkCollector) buildIncusMapping(ifindexMap map[int]string) map[string]string {
+	result := make(map[string]string)
+
+	procDir := c.opts.ProcPath
+	entries, err := os.ReadDir(procDir)
+	if err != nil {
+		return result
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 1 {
+			continue
+		}
+
+		// Read the cgroup file to check for LXC container init processes.
+		cgroupData := readFileString(filepath.Join(procDir, entry.Name(), "cgroup"))
+		if cgroupData == "" {
+			continue
+		}
+
+		// Look for the pattern "lxc.payload.<name>/init.scope".
+		// Only match init.scope to avoid scanning all container processes.
+		containerName := parseLXCCgroup(cgroupData)
+		if containerName == "" {
+			continue
+		}
+
+		// Skip if we already mapped this container (multiple init.scope PIDs).
+		alreadyMapped := false
+		for _, name := range result {
+			if name == containerName {
+				alreadyMapped = true
+				break
+			}
+		}
+		if alreadyMapped {
+			continue
+		}
+
+		// Find host-side veth interfaces via iflink.
+		iflinks := c.findContainerIflinks(procDir, pid)
+		for _, hostIfindex := range iflinks {
+			if hostIface, ok := ifindexMap[hostIfindex]; ok {
+				result[hostIface] = containerName
+			}
+		}
+	}
+
+	if len(result) > 0 {
+		c.logger.Debug("mapped Incus/LXC containers", "count", len(result))
+	}
+
+	return result
+}
+
+// parseLXCCgroup extracts the LXC container name from a cgroup file content.
+// Returns empty string if not an LXC container init process.
+// Expected format: "0::/lxc.payload.backupserver/init.scope"
+func parseLXCCgroup(data string) string {
+	for _, line := range strings.Split(data, "\n") {
+		idx := strings.Index(line, "lxc.payload.")
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+len("lxc.payload."):]
+		slashIdx := strings.Index(rest, "/")
+		if slashIdx <= 0 {
+			continue
+		}
+		// Only match init processes to avoid duplicates.
+		suffix := rest[slashIdx:]
+		if suffix != "/init.scope" {
+			continue
+		}
+		return rest[:slashIdx]
+	}
+	return ""
 }
 
 // buildCommand creates an exec.Cmd that optionally uses chroot for container mode.

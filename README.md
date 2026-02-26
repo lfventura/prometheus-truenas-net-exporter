@@ -16,11 +16,12 @@ On a TrueNAS SCALE system, a single host can have 40+ network interfaces: physic
 
 - Reads traffic counters from `/proc/1/net/dev` (host network namespace)
 - Maps Docker container veth interfaces → container names via Docker Engine API
+- Maps Incus/LXC container veth interfaces → container names via cgroup scanning
 - Maps VM vnet/macvtap interfaces → VM names via TrueNAS `midclt` API (with `virsh` fallback)
 - Resolves Docker bridge interfaces → Docker network names via Networks API
 - Extracts application names from Docker Compose project labels (`ix-<app>` prefix for TrueNAS apps)
 - Derives `app` label for bridges and orphan veths from their Docker network name
-- Classifies all interfaces: `physical`, `bridge`, `docker`, `vm`, `vlan`, `macvtap`, `loopback`
+- Classifies all interfaces: `physical`, `bridge`, `docker`, `incus`, `vm`, `vlan`, `macvtap`, `loopback`
 
 ## Metrics
 
@@ -45,7 +46,7 @@ All metrics are counters. Use `rate()` or `derivative()` for throughput.
 |---|---|---|
 | `interface` | Host-side kernel interface name | `veth402dbe0`, `enp8s0f0`, `br0`, `vnet3` |
 | `instance` | Resolved human-readable name | `ix-grafana-grafana-1`, `vyos`, `enp8s0f0` |
-| `instance_type` | Interface classification | `physical`, `bridge`, `docker`, `vm`, `vlan`, `macvtap`, `loopback` |
+| `instance_type` | Interface classification | `physical`, `bridge`, `docker`, `incus`, `vm`, `vlan`, `macvtap`, `loopback` |
 | `app` | Application name (from Docker Compose project or network) | `grafana`, `immich`, `jellyfin` |
 | `bridge` | Parent bridge (if interface is a bridge member) | `br0`, `br-2c852816592c` |
 | `state` | Link state from sysfs operstate | `up`, `down`, `unknown` |
@@ -67,6 +68,9 @@ net_interface_rx_bytes_total{interface="vnet3",instance="vyos",instance_type="vm
 
 # macvtap interface mapped to VM name
 net_interface_rx_bytes_total{interface="macvtap0",instance="vyos",instance_type="macvtap",app="",bridge="",state="up"} 1.111594084954e+12
+
+# Incus/LXC container
+net_interface_rx_bytes_total{interface="veth105cce14",instance="backupserver",instance_type="incus",app="",bridge="br0",state="up"} 8.559759e+06
 
 # System bridge
 net_interface_rx_bytes_total{interface="br0",instance="br0",instance_type="bridge",app="",bridge="",state="up"} 1.343738956933e+12
@@ -99,6 +103,10 @@ A typical TrueNAS SCALE system creates a complex network topology:
                         │  br1 ──── vlan2 + vnet2 + vnet5         │
                         │                                         │
   macvtap               │  macvtap0 ── vyos (direct to NIC)       │
+                        │                                         │
+  Incus/LXC Containers  │  veth105cce14 ── backupserver (br0)     │
+                        │  vethXXXXXXXX ── crapscrap (br0)        │
+                        │  vethXXXXXXXX ── pzserver (br0)         │
                         │                                         │
   Docker Bridges        │  br-2c852816592c (ix-grafana_default)   │
   (one per app network) │  │  └── veth402dbe0 → ix-grafana-1      │
@@ -216,6 +224,28 @@ midclt call vm.query → [{"name": "vyos", "status": {"pid": 7730, "state": "RUN
 1. `virsh list --name --state-running` → get VM names
 2. `virsh domiflist <vm>` → get interface names per VM
 
+### Step 6: Incus/LXC Container Mapping (veth → container name)
+
+Incus/LXC containers use veth pairs like Docker but are not managed by the Docker API. They're discovered by scanning `/proc` for processes in LXC cgroups.
+
+**Mapping process**:
+
+1. Scan `/proc/<PID>/cgroup` for all processes
+2. Look for cgroup paths matching `lxc.payload.<containername>/init.scope`
+3. Only match `/init.scope` to find the container's init process (avoids processing every process inside the container)
+4. Use the same iflink technique as Docker to map the container's veth to the host
+
+```
+/proc/8444/cgroup → "0::/lxc.payload.backupserver/init.scope"
+  └── Container name: "backupserver", Init PID: 8444
+
+/proc/8444/root/sys/class/net/eth0/iflink → "18"
+/sys/class/net/veth105cce14/ifindex → "18"
+  ∴ veth105cce14 belongs to Incus container "backupserver"
+```
+
+Incus containers are labeled with `instance_type="incus"` to distinguish them from Docker containers.
+
 ### Data Flow Diagram
 
 ```
@@ -324,6 +354,9 @@ sum by (app) (rate(net_interface_tx_bytes_total{instance_type="docker", app!=""}
 # Traffic rate per VM
 sum by (instance) (rate(net_interface_tx_bytes_total{instance_type="vm"}[5m]))
 
+# Traffic rate per Incus/LXC container
+sum by (instance) (rate(net_interface_tx_bytes_total{instance_type="incus"}[5m]))
+
 # Traffic rate per physical NIC
 rate(net_interface_tx_bytes_total{instance_type="physical"}[5m])
 
@@ -395,6 +428,18 @@ from(bucket: "metrics_prometheus")
 ```bash
 # Inside the exporter container:
 chroot /host midclt call vm.query
+```
+
+### Incus/LXC containers not mapped
+
+**Symptom**: `instance_type="docker"` for an Incus container, `instance` shows raw veth name.
+
+**Cause**: The exporter scans `/proc/<PID>/cgroup` for `lxc.payload.<name>/init.scope`. If the cgroup structure differs (older LXC versions), the pattern won't match.
+
+**Debug**: Check the cgroup format of your Incus container:
+```bash
+cat /proc/<container-init-pid>/cgroup
+# Expected: 0::/lxc.payload.containername/init.scope
 ```
 
 ### Bridges show hash names instead of network names
