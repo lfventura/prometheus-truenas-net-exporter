@@ -294,9 +294,15 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 		case strings.HasPrefix(iface, "br-") || strings.HasPrefix(iface, "br") ||
 			strings.HasPrefix(iface, "docker") || strings.HasPrefix(iface, "incus"):
 			info.InstanceType = "bridge"
-			if netInfo, ok := bridgeToNetwork[iface]; ok {
-				info.Instance = netInfo.Name
-				info.App = appNameFromDockerNetwork(netInfo.Name)
+			// Only use Docker network name for hash-named bridges (br-<hash>).
+			// Well-known bridges (br0, docker0, incusbr0) keep their own name.
+			if strings.HasPrefix(iface, "br-") {
+				if netInfo, ok := bridgeToNetwork[iface]; ok {
+					info.Instance = netInfo.Name
+					info.App = appNameFromDockerNetwork(netInfo.Name)
+				} else {
+					info.Instance = iface
+				}
 			} else {
 				info.Instance = iface
 			}
