@@ -4,7 +4,7 @@ A Prometheus exporter that collects per-network-interface traffic metrics on Lin
 
 ## Why this exporter?
 
-On a TrueNAS SCALE system, a single host can have 40+ network interfaces: physical NICs, Linux bridges, Docker container veths, VM taps, VLANs, and macvtap devices. Standard tools like `node_exporter` report raw interface names (`veth402dbe0`, `vnet3`, `br-2c852816592c`) — meaningless without cross-referencing Docker, QEMU, and sysfs. This exporter enriches every interface with:
+On a TrueNAS SCALE system, a single host can have 40+ network interfaces: physical NICs, Linux bridges, Docker container veths, VM taps, VLANs, and macvtap devices. Standard tools like `node_exporter` report raw interface names (`vethABC1234`, `vnet0`, `br-a1b2c3d4e5f6`) — meaningless without cross-referencing Docker, QEMU, and sysfs. This exporter enriches every interface with:
 
 - **What it is** (`instance_type`): physical, bridge, docker, vm, vlan, macvtap, loopback
 - **Who owns it** (`instance`): container name, VM name, or interface name
@@ -46,11 +46,11 @@ All metrics are counters. Use `rate()` or `derivative()` for throughput.
 
 | Label | Description | Examples |
 |---|---|---|
-| `interface` | Host-side kernel interface name | `veth402dbe0`, `enp8s0f0`, `br0`, `vnet3` |
-| `instance` | Resolved human-readable name | `ix-grafana-grafana-1`, `vyos`, `enp8s0f0` |
+| `interface` | Host-side kernel interface name | `vethABC1234`, `eth0`, `br0`, `vnet0` |
+| `instance` | Resolved human-readable name | `ix-myapp-web-1`, `router-vm`, `eth0` |
 | `instance_type` | Interface classification | `physical`, `bridge`, `docker`, `incus`, `vm`, `vlan`, `macvtap`, `loopback` |
-| `app` | Application name (from Docker Compose project or network) | `grafana`, `immich`, `jellyfin` |
-| `bridge` | Parent bridge (if interface is a bridge member) | `br0`, `br-2c852816592c` |
+| `app` | Application name (from Docker Compose project or network) | `myapp`, `media-server`, `dns` |
+| `bridge` | Parent bridge (if interface is a bridge member) | `br0`, `br-a1b2c3d4e5f6` |
 | `vlan` | 802.1Q VLAN ID (inherited from bridge uplink) | `1`, `100`, `200` |
 | `state` | Link state from sysfs operstate | `up`, `down`, `unknown` |
 
@@ -58,28 +58,28 @@ All metrics are counters. Use `rate()` or `derivative()` for throughput.
 
 ```
 # Physical NIC
-net_interface_rx_bytes_total{interface="enp8s0f0",instance="enp8s0f0",instance_type="physical",app="system",bridge="",vlan="",state="up"} 1.111594096922e+12
+net_interface_rx_bytes_total{interface="eth0",instance="eth0",instance_type="physical",app="system",bridge="",vlan="",state="up"} 1.234567890123e+12
 
-# Docker container mapped to app (inherits VLAN from bridge)
-net_interface_rx_bytes_total{interface="veth402dbe0",instance="ix-grafana-grafana-1",instance_type="docker",app="grafana",bridge="br-2c852816592c",vlan="",state="up"} 2.56302961e+08
+# Docker container mapped to app
+net_interface_rx_bytes_total{interface="vethABC1234",instance="ix-myapp-web-1",instance_type="docker",app="myapp",bridge="br-a1b2c3d4e5f6",vlan="",state="up"} 2.56302961e+08
 
 # Docker bridge mapped to network name with app
-net_interface_rx_bytes_total{interface="br-2c852816592c",instance="ix-grafana_default",instance_type="bridge",app="grafana",bridge="",vlan="",state="up"} 2.54524065e+08
+net_interface_rx_bytes_total{interface="br-a1b2c3d4e5f6",instance="ix-myapp_default",instance_type="bridge",app="myapp",bridge="",vlan="",state="up"} 2.54524065e+08
 
-# VM tap interface mapped to VM name (inherits VLAN 1 from br0)
-net_interface_rx_bytes_total{interface="vnet3",instance="vyos",instance_type="vm",app="vyos",bridge="br0",vlan="1",state="unknown"} 1.115796347231e+12
+# VM tap interface mapped to VM name (inherits VLAN 10 from br0)
+net_interface_rx_bytes_total{interface="vnet0",instance="router-vm",instance_type="vm",app="router-vm",bridge="br0",vlan="10",state="unknown"} 1.115796347231e+12
 
 # macvtap interface mapped to VM name
-net_interface_rx_bytes_total{interface="macvtap0",instance="vyos",instance_type="macvtap",app="vyos",bridge="",vlan="",state="up"} 1.111594084954e+12
+net_interface_rx_bytes_total{interface="macvtap0",instance="router-vm",instance_type="macvtap",app="router-vm",bridge="",vlan="",state="up"} 1.111594084954e+12
 
-# Incus/LXC container (inherits VLAN 1 from br0)
-net_interface_rx_bytes_total{interface="veth105cce14",instance="backupserver",instance_type="incus",app="backupserver",bridge="br0",vlan="1",state="up"} 8.559759e+06
+# Incus/LXC container (inherits VLAN 10 from br0)
+net_interface_rx_bytes_total{interface="vethDEF5678",instance="web-server",instance_type="incus",app="web-server",bridge="br0",vlan="10",state="up"} 8.559759e+06
 
-# System bridge (VLAN 1 because vlan1 is a member)
-net_interface_rx_bytes_total{interface="br0",instance="br0",instance_type="bridge",app="system",bridge="",vlan="1",state="up"} 1.343738956933e+12
+# System bridge (VLAN 10 because vlan10 is a member)
+net_interface_rx_bytes_total{interface="br0",instance="br0",instance_type="bridge",app="system",bridge="",vlan="10",state="up"} 1.343738956933e+12
 
 # VLAN sub-interface
-net_interface_rx_bytes_total{interface="vlan1",instance="vlan1",instance_type="vlan",app="system",bridge="br0",vlan="1",state="up"} 2.17320405154e+11
+net_interface_rx_bytes_total{interface="vlan10",instance="vlan10",instance_type="vlan",app="system",bridge="br0",vlan="10",state="up"} 2.17320405154e+11
 ```
 
 ---
@@ -94,30 +94,30 @@ A typical TrueNAS SCALE system creates a complex network topology:
                         ┌─────────────────────────────────────────┐
                         │              TrueNAS Host               │
                         │                                         │
-  Physical NICs         │  enp8s0f0 ──┐                           │
-                        │  enp8s0f1 ──┤                           │
+  Physical NICs         │  eth0 ──────┐                           │
+                        │  eth1 ──────┤                           │
                         │             │                           │
   System Bridges        │  br0 ───────┤ (main bridge)             │
-                        │  │  ├── vlan1  (VLAN trunk)             │
-                        │  │  ├── vnet0  (pihole VM)              │
-                        │  │  ├── vnet1  (pritunl VM)             │
-                        │  │  ├── vnet3  (vyos VM)                │
+                        │  │  ├── vlan10 (VLAN sub-interface)     │
+                        │  │  ├── vnet0  (dns-vm)                 │
+                        │  │  ├── vnet1  (vpn-vm)                 │
+                        │  │  ├── vnet2  (router-vm)              │
                         │  │  └── ...                             │
-                        │  br1 ──── vlan2 + vnet2 + vnet5         │
+                        │  br1 ──── vlan20 + vnet3 + vnet4        │
                         │                                         │
-  macvtap               │  macvtap0 ── vyos (direct to NIC)       │
+  macvtap               │  macvtap0 ── router-vm (direct to NIC)  │
                         │                                         │
-  Incus/LXC Containers  │  veth105cce14 ── backupserver (br0)     │
-                        │  vethXXXXXXXX ── crapscrap (br0)        │
-                        │  vethXXXXXXXX ── pzserver (br0)         │
+  Incus/LXC Containers  │  vethDEF5678 ── web-server (br0)        │
+                        │  vethXXXXXXXX ── db-server (br0)        │
+                        │  vethXXXXXXXX ── backup-srv (br0)       │
                         │                                         │
-  Docker Bridges        │  br-2c852816592c (ix-grafana_default)   │
-  (one per app network) │  │  └── veth402dbe0 → ix-grafana-1      │
-                        │  br-f33136af96f9 (ix-immich_net)        │
-                        │  │  ├── veth8b2f7e9 → immich-ml-1       │
-                        │  │  ├── vethc4b3cbf → immich-pgvecto-1  │
-                        │  │  ├── veth4be5411 → immich-redis-1    │
-                        │  │  └── veth3f3cbed → immich-server-1   │
+  Docker Bridges        │  br-a1b2c3d4e5f6 (ix-myapp_default)     │
+  (one per app network) │  │  └── vethABC1234 → ix-myapp-web-1    │
+                        │  br-x9y8z7w6v5u4 (ix-media_net)         │
+                        │  │  ├── veth1111111 → media-api-1       │
+                        │  │  ├── veth2222222 → media-db-1        │
+                        │  │  ├── veth3333333 → media-cache-1     │
+                        │  │  └── veth4444444 → media-worker-1    │
                         │  ...                                    │
                         └─────────────────────────────────────────┘
 ```
@@ -150,7 +150,7 @@ Each interface is classified using sysfs heuristics:
 
 Bridge membership is detected via the sysfs `master` symlink:
 ```
-/sys/class/net/veth402dbe0/master → ../../br-2c852816592c
+/sys/class/net/vethABC1234/master → ../../br-a1b2c3d4e5f6
 ```
 
 Interface state is read from:
@@ -173,11 +173,11 @@ Docker creates a **veth pair** for each container: one end inside the container 
 5. Match ifindex to host interface names via `/sys/class/net/<iface>/ifindex`
 
 ```
-Container PID 12345
-  └── /proc/12345/root/sys/class/net/eth0/iflink → "42"
+Container PID 3456
+  └── /proc/3456/root/sys/class/net/eth0/iflink → "42"
 Host
-  └── /sys/class/net/veth402dbe0/ifindex → "42"
-  ∴ veth402dbe0 belongs to container PID 12345
+  └── /sys/class/net/vethABC1234/ifindex → "42"
+  ∴ vethABC1234 belongs to container PID 3456
 ```
 
 **App name extraction**: Read the `com.docker.compose.project` label from the container. TrueNAS apps set this to `ix-<appname>`, so we strip the `ix-` prefix.
@@ -194,10 +194,10 @@ Docker creates one Linux bridge per Docker network, named `br-<first 12 chars of
    - Otherwise: `br-` + first 12 chars of network ID
 3. Map bridge interface → Docker network name
 
-**App derivation from network name**: TrueNAS apps create Docker networks named `ix-<appname>_<suffix>` (e.g., `ix-grafana_default`, `ix-immich_ix-internal-immich-net`). The app name is extracted by stripping `ix-` and taking everything before the first `_`.
+**App derivation from network name**: TrueNAS apps create Docker networks named `ix-<appname>_<suffix>` (e.g., `ix-myapp_default`, `ix-media_ix-internal-media-net`). The app name is extracted by stripping `ix-` and taking everything before the first `_`.
 
 This provides:
-- `app` label for bridge interfaces (e.g., `br-2c852816592c` → app `grafana`)
+- `app` label for bridge interfaces (e.g., `br-a1b2c3d4e5f6` → app `myapp`)
 - `app` label for orphan veths (veths whose container disappeared between scrapes) — derived from their parent bridge's network name
 
 ### Step 5: VM Mapping (vnet/macvtap → VM name)
@@ -213,13 +213,13 @@ TrueNAS SCALE uses QEMU for VMs but does **not** expose a standard `libvirt` soc
    - **macvtap interfaces**: FD points to `/dev/tapN` where N is the ifindex → resolve via sysfs
 
 ```
-midclt call vm.query → [{"name": "vyos", "status": {"pid": 7730, "state": "RUNNING"}}]
+midclt call vm.query → [{"name": "router-vm", "status": {"pid": 5001, "state": "RUNNING"}}]
 
-/proc/7730/fd/45 → /dev/net/tun
-/proc/7730/fdinfo/45 → "iff:\tvnet2"      ← tap interface "vnet2" belongs to "vyos"
+/proc/5001/fd/45 → /dev/net/tun
+/proc/5001/fdinfo/45 → "iff:\tvnet0"      ← tap interface "vnet0" belongs to "router-vm"
 
-/proc/7730/fd/50 → /dev/tap14
-/sys/class/net/macvtap0/ifindex → "14"     ← macvtap0 belongs to "vyos"
+/proc/5001/fd/50 → /dev/tap14
+/sys/class/net/macvtap0/ifindex → "14"     ← macvtap0 belongs to "router-vm"
 ```
 
 **Fallback — `virsh`** (for non-TrueNAS systems):
@@ -239,12 +239,12 @@ Incus/LXC containers use veth pairs like Docker but are not managed by the Docke
 4. Use the same iflink technique as Docker to map the container's veth to the host
 
 ```
-/proc/8444/cgroup → "0::/lxc.payload.backupserver/init.scope"
-  └── Container name: "backupserver", Init PID: 8444
+/proc/6200/cgroup → "0::/lxc.payload.web-server/init.scope"
+  └── Container name: "web-server", Init PID: 6200
 
-/proc/8444/root/sys/class/net/eth0/iflink → "18"
-/sys/class/net/veth105cce14/ifindex → "18"
-  ∴ veth105cce14 belongs to Incus container "backupserver"
+/proc/6200/root/sys/class/net/eth0/iflink → "18"
+/sys/class/net/vethDEF5678/ifindex → "18"
+  ∴ vethDEF5678 belongs to Incus container "web-server"
 ```
 
 Incus containers are labeled with `instance_type="incus"` to distinguish them from Docker containers.
@@ -256,14 +256,14 @@ Incus containers are labeled with `instance_type="incus"` to distinguish them fr
 ```
 VLAN Dev name       | VLAN ID
 Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD
-vlan1              | 1  | enp8s0f1
-vlan2              | 2  | enp8s0f0
+vlan10             | 10 | eth0
+vlan20             | 20 | eth1
 ```
 
 **VLAN propagation**:
 
-1. VLAN sub-interfaces (e.g., `vlan1`) get the VLAN ID directly (`vlan="1"`)
-2. Bridges inherit the VLAN ID from any VLAN member: if `vlan1` is a member of `br0`, then `br0` gets `vlan="1"`
+1. VLAN sub-interfaces (e.g., `vlan10`) get the VLAN ID directly (`vlan="10"`)
+2. Bridges inherit the VLAN ID from any VLAN member: if `vlan10` is a member of `br0`, then `br0` gets `vlan="10"`
 3. All bridge members (veths, vnets) inherit the VLAN from their parent bridge
 4. Non-VLAN dot-notation interfaces (e.g., `eno1.100`) are also detected and reclassified as `instance_type="vlan"`
 
@@ -785,7 +785,7 @@ from(bucket: "metrics_prometheus")
 
 ### VMs not mapped (vnet shows interface name instead of VM name)
 
-**Symptom**: `instance_type="vm"` but `instance="vnet0"` instead of `instance="pihole"`.
+**Symptom**: `instance_type="vm"` but `instance="vnet0"` instead of the actual VM name.
 
 **Causes**:
 1. On TrueNAS: `midclt` not available via chroot → check that `/host` mount includes `/usr/bin/midclt`
@@ -812,7 +812,7 @@ cat /proc/<container-init-pid>/cgroup
 
 ### Bridges show hash names instead of network names
 
-**Symptom**: `instance="br-2c852816592c"` instead of `instance="ix-grafana_default"`.
+**Symptom**: `instance="br-a1b2c3d4e5f6"` instead of the Docker network name.
 
 **Cause**: Docker Networks API not accessible or returned an error.
 
