@@ -40,6 +40,7 @@ type interfaceInfo struct {
 	InstanceType string // "physical", "bridge", "docker", "vm", "vlan", "macvtap", "loopback", "unknown"
 	App          string // application name (Docker Compose project)
 	Bridge       string // parent bridge, if any
+	VLAN         string // 802.1Q VLAN ID (inherited from bridge uplink if applicable)
 	State        string // "up", "down", "unknown"
 }
 
@@ -58,7 +59,7 @@ type interfaceStats struct {
 // NewNetworkCollector returns a collector that exposes per-interface network
 // traffic metrics with container/instance enrichment labels.
 func NewNetworkCollector(logger *slog.Logger, opts Options, dockerSocket string) *NetworkCollector {
-	labels := []string{"interface", "instance", "instance_type", "app", "bridge", "state"}
+	labels := []string{"interface", "instance", "instance_type", "app", "bridge", "vlan", "state"}
 
 	return &NetworkCollector{
 		opts:         opts,
@@ -140,7 +141,7 @@ func (c *NetworkCollector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 
-		labels := []string{info.Name, info.Instance, info.InstanceType, info.App, info.Bridge, info.State}
+		labels := []string{info.Name, info.Instance, info.InstanceType, info.App, info.Bridge, info.VLAN, info.State}
 
 		ch <- prometheus.MustNewConstMetric(c.rxBytes, prometheus.CounterValue, float64(s.RxBytes), labels...)
 		ch <- prometheus.MustNewConstMetric(c.txBytes, prometheus.CounterValue, float64(s.TxBytes), labels...)
@@ -244,6 +245,18 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 	// Query midclt/virsh for VM → vnet mapping.
 	vnetToVM := c.buildVMMapping()
 
+	// Parse VLAN sub-interfaces from /proc/net/vlan/config.
+	vlanMap := c.buildVLANMap()
+
+	// Build bridge → VLAN mapping: for each bridge, find the VLAN ID of any
+	// VLAN sub-interface that is a member of that bridge.
+	bridgeVLAN := make(map[string]string)
+	for iface, vi := range vlanMap {
+		if br, ok := bridgeMap[iface]; ok {
+			bridgeVLAN[br] = vi.ID
+		}
+	}
+
 	result := make(map[string]interfaceInfo)
 	for iface := range stats {
 		info := interfaceInfo{
@@ -278,6 +291,10 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 					}
 				}
 			}
+			// Inherit VLAN from parent bridge.
+			if br := bridgeMap[iface]; br != "" {
+				info.VLAN = bridgeVLAN[br]
+			}
 
 		case strings.HasPrefix(iface, "vnet"):
 			// VM network interface (libvirt tap/tun).
@@ -287,6 +304,10 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 				info.App = vmName
 			} else {
 				info.Instance = iface
+			}
+			// Inherit VLAN from parent bridge.
+			if br := bridgeMap[iface]; br != "" {
+				info.VLAN = bridgeVLAN[br]
 			}
 
 		case strings.HasPrefix(iface, "macvtap") || strings.HasPrefix(iface, "macvlan"):
@@ -302,10 +323,14 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 			info.InstanceType = "vlan"
 			info.Instance = iface
 			info.App = "system"
+			if vi, ok := vlanMap[iface]; ok {
+				info.VLAN = vi.ID
+			}
 
 		case strings.HasPrefix(iface, "br-") || strings.HasPrefix(iface, "br") ||
 			strings.HasPrefix(iface, "docker") || strings.HasPrefix(iface, "incus"):
 			info.InstanceType = "bridge"
+			info.VLAN = bridgeVLAN[iface]
 			// Only use Docker network name for hash-named bridges (br-<hash>).
 			// Well-known bridges (br0, docker0, incusbr0) keep their own name.
 			if strings.HasPrefix(iface, "br-") {
@@ -330,6 +355,11 @@ func (c *NetworkCollector) buildInterfaceInfo(stats map[string]interfaceStats) m
 			}
 			info.Instance = iface
 			info.App = "system"
+			// Check if this is a VLAN sub-interface (e.g. eno1.100).
+			if vi, ok := vlanMap[iface]; ok {
+				info.InstanceType = "vlan"
+				info.VLAN = vi.ID
+			}
 		}
 
 		result[iface] = info
@@ -344,6 +374,58 @@ func (c *NetworkCollector) sysClassNetPath() string {
 		return filepath.Join(c.opts.RootfsPath, "sys", "class", "net")
 	}
 	return "/sys/class/net"
+}
+
+// vlanInfo describes one 802.1Q VLAN sub-interface.
+type vlanInfo struct {
+	ID     string // VLAN ID (e.g., "100")
+	Parent string // Parent device (e.g., "eno1")
+}
+
+// buildVLANMap parses /proc/net/vlan/config to discover 802.1Q VLAN
+// sub-interfaces. Returns a map from interface name to VLAN info.
+//
+// Format of /proc/net/vlan/config:
+//
+//	VLAN Dev name       | VLAN ID
+//	Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD
+//	eno1.100           | 100  | eno1
+func (c *NetworkCollector) buildVLANMap() map[string]vlanInfo {
+	result := make(map[string]vlanInfo)
+
+	path := filepath.Join(c.opts.ProcPath, "1", "net", "vlan", "config")
+	f, err := os.Open(path)
+	if err != nil {
+		c.logger.Debug("VLAN config not available", "path", path, "error", err)
+		return result
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Skip headers and blank lines.
+		if strings.HasPrefix(line, "VLAN") || strings.HasPrefix(line, "Name-Type:") || strings.TrimSpace(line) == "" {
+			continue
+		}
+		// Parse: "<dev_name> | <vlan_id> | <parent_dev>"
+		parts := strings.Split(line, "|")
+		if len(parts) < 3 {
+			continue
+		}
+		devName := strings.TrimSpace(parts[0])
+		vlanID := strings.TrimSpace(parts[1])
+		parent := strings.TrimSpace(parts[2])
+		if devName != "" && vlanID != "" {
+			result[devName] = vlanInfo{ID: vlanID, Parent: parent}
+		}
+	}
+
+	if len(result) > 0 {
+		c.logger.Debug("discovered VLAN interfaces", "count", len(result))
+	}
+
+	return result
 }
 
 // buildBridgeMap returns a mapping from interface name → parent bridge name.

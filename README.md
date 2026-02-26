@@ -10,6 +10,7 @@ On a TrueNAS SCALE system, a single host can have 40+ network interfaces: physic
 - **Who owns it** (`instance`): container name, VM name, or interface name
 - **Which application** (`app`): derived from Docker Compose project labels or Docker network names
 - **Bridge membership** (`bridge`): which bridge the interface is attached to
+- **VLAN ID** (`vlan`): 802.1Q VLAN ID (from `/proc/net/vlan/config`), inherited by bridge members
 - **Link state** (`state`): up, down, or unknown
 
 ## Features
@@ -21,6 +22,7 @@ On a TrueNAS SCALE system, a single host can have 40+ network interfaces: physic
 - Resolves Docker bridge interfaces → Docker network names via Networks API
 - Extracts application names from Docker Compose project labels (`ix-<app>` prefix for TrueNAS apps)
 - Derives `app` label for bridges and orphan veths from their Docker network name
+- Discovers 802.1Q VLANs from `/proc/net/vlan/config` and propagates VLAN IDs to bridges and their members
 - Classifies all interfaces: `physical`, `bridge`, `docker`, `incus`, `vm`, `vlan`, `macvtap`, `loopback`
 
 ## Metrics
@@ -49,34 +51,35 @@ All metrics are counters. Use `rate()` or `derivative()` for throughput.
 | `instance_type` | Interface classification | `physical`, `bridge`, `docker`, `incus`, `vm`, `vlan`, `macvtap`, `loopback` |
 | `app` | Application name (from Docker Compose project or network) | `grafana`, `immich`, `jellyfin` |
 | `bridge` | Parent bridge (if interface is a bridge member) | `br0`, `br-2c852816592c` |
+| `vlan` | 802.1Q VLAN ID (inherited from bridge uplink) | `1`, `100`, `200` |
 | `state` | Link state from sysfs operstate | `up`, `down`, `unknown` |
 
 ### Example Output
 
 ```
 # Physical NIC
-net_interface_rx_bytes_total{interface="enp8s0f0",instance="enp8s0f0",instance_type="physical",app="",bridge="",state="up"} 1.111594096922e+12
+net_interface_rx_bytes_total{interface="enp8s0f0",instance="enp8s0f0",instance_type="physical",app="system",bridge="",vlan="",state="up"} 1.111594096922e+12
 
-# Docker container mapped to app
-net_interface_rx_bytes_total{interface="veth402dbe0",instance="ix-grafana-grafana-1",instance_type="docker",app="grafana",bridge="br-2c852816592c",state="up"} 2.56302961e+08
+# Docker container mapped to app (inherits VLAN from bridge)
+net_interface_rx_bytes_total{interface="veth402dbe0",instance="ix-grafana-grafana-1",instance_type="docker",app="grafana",bridge="br-2c852816592c",vlan="",state="up"} 2.56302961e+08
 
 # Docker bridge mapped to network name with app
-net_interface_rx_bytes_total{interface="br-2c852816592c",instance="ix-grafana_default",instance_type="bridge",app="grafana",bridge="",state="up"} 2.54524065e+08
+net_interface_rx_bytes_total{interface="br-2c852816592c",instance="ix-grafana_default",instance_type="bridge",app="grafana",bridge="",vlan="",state="up"} 2.54524065e+08
 
-# VM tap interface mapped to VM name
-net_interface_rx_bytes_total{interface="vnet3",instance="vyos",instance_type="vm",app="",bridge="br0",state="unknown"} 1.115796347231e+12
+# VM tap interface mapped to VM name (inherits VLAN 1 from br0)
+net_interface_rx_bytes_total{interface="vnet3",instance="vyos",instance_type="vm",app="vyos",bridge="br0",vlan="1",state="unknown"} 1.115796347231e+12
 
 # macvtap interface mapped to VM name
-net_interface_rx_bytes_total{interface="macvtap0",instance="vyos",instance_type="macvtap",app="",bridge="",state="up"} 1.111594084954e+12
+net_interface_rx_bytes_total{interface="macvtap0",instance="vyos",instance_type="macvtap",app="vyos",bridge="",vlan="",state="up"} 1.111594084954e+12
 
-# Incus/LXC container
-net_interface_rx_bytes_total{interface="veth105cce14",instance="backupserver",instance_type="incus",app="",bridge="br0",state="up"} 8.559759e+06
+# Incus/LXC container (inherits VLAN 1 from br0)
+net_interface_rx_bytes_total{interface="veth105cce14",instance="backupserver",instance_type="incus",app="backupserver",bridge="br0",vlan="1",state="up"} 8.559759e+06
 
-# System bridge
-net_interface_rx_bytes_total{interface="br0",instance="br0",instance_type="bridge",app="",bridge="",state="up"} 1.343738956933e+12
+# System bridge (VLAN 1 because vlan1 is a member)
+net_interface_rx_bytes_total{interface="br0",instance="br0",instance_type="bridge",app="system",bridge="",vlan="1",state="up"} 1.343738956933e+12
 
-# VLAN
-net_interface_rx_bytes_total{interface="vlan1",instance="vlan1",instance_type="vlan",app="",bridge="br0",state="up"} 2.17320405154e+11
+# VLAN sub-interface
+net_interface_rx_bytes_total{interface="vlan1",instance="vlan1",instance_type="vlan",app="system",bridge="br0",vlan="1",state="up"} 2.17320405154e+11
 ```
 
 ---
@@ -246,6 +249,33 @@ Incus/LXC containers use veth pairs like Docker but are not managed by the Docke
 
 Incus containers are labeled with `instance_type="incus"` to distinguish them from Docker containers.
 
+### Step 7: VLAN Detection (`/proc/net/vlan/config`)
+
+802.1Q VLAN sub-interfaces are discovered by parsing `/proc/1/net/vlan/config`:
+
+```
+VLAN Dev name       | VLAN ID
+Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD
+vlan1              | 1  | enp8s0f1
+vlan2              | 2  | enp8s0f0
+```
+
+**VLAN propagation**:
+
+1. VLAN sub-interfaces (e.g., `vlan1`) get the VLAN ID directly (`vlan="1"`)
+2. Bridges inherit the VLAN ID from any VLAN member: if `vlan1` is a member of `br0`, then `br0` gets `vlan="1"`
+3. All bridge members (veths, vnets) inherit the VLAN from their parent bridge
+4. Non-VLAN dot-notation interfaces (e.g., `eno1.100`) are also detected and reclassified as `instance_type="vlan"`
+
+This allows filtering and grouping by VLAN across all interface types:
+```
+# Which VMs are on VLAN 1?
+net_interface_rx_bytes_total{instance_type="vm", vlan="1"}
+
+# Traffic per VLAN
+sum by (vlan) (rate(net_interface_tx_bytes_total{vlan!=""}[5m]))
+```
+
 ### Data Flow Diagram
 
 ```
@@ -267,7 +297,8 @@ Incus containers are labeled with `instance_type="incus"` to distinguish them fr
 │  3. Build host ifindex map → map[ifindex]iface                               │
 │  4. Docker: containers → veth mapping + networks → bridge mapping            │
 │  5. midclt: VMs → QEMU PIDs → fdinfo → vnet/macvtap mapping                 │
-│  6. Classify + emit metrics with enriched labels                             │
+│  6. /proc/1/net/vlan/config → VLAN IDs, propagated to bridges + members      │
+│  7. Classify + emit metrics with enriched labels                             │
 └────────────────────────────────────────────────────────────────────────────────┘
          │
          ▼
@@ -345,7 +376,7 @@ scrape_configs:
 
 ## Grafana Queries
 
-### PromQL
+### PromQL (Prometheus)
 
 ```promql
 # Traffic rate per Docker app
@@ -363,23 +394,173 @@ rate(net_interface_tx_bytes_total{instance_type="physical"}[5m])
 # Total bridge traffic
 sum by (instance) (rate(net_interface_tx_bytes_total{instance_type="bridge", app!=""}[5m]))
 
+# Traffic per VLAN
+sum by (vlan) (rate(net_interface_tx_bytes_total{vlan!=""}[5m]))
+
 # Errors + drops per interface
 rate(net_interface_rx_errors_total[5m]) + rate(net_interface_rx_dropped_total[5m])
+
+# All VMs on VLAN 1
+rate(net_interface_tx_bytes_total{instance_type="vm", vlan="1"}[5m])
 ```
 
 ### Flux (InfluxDB)
 
+All Flux examples below use bucket `metrics_prometheus`. Replace with your bucket name. The `_measurement` value depends on your Telegraf/scrape configuration.
+
+### 1. Overview Dashboard
+
 ```flux
-// TX throughput per Docker app
+// Total RX throughput — all interfaces combined (bytes/s)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group()
+  |> sum()
+
+// Total TX throughput — all interfaces combined (bytes/s)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group()
+  |> sum()
+
+// Traffic breakdown by instance_type (stacked area)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["instance_type"])
+  |> sum()
+
+// Total traffic by VLAN (stacked area)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["vlan"] != "")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["vlan"])
+  |> sum()
+
+// Interface count by type (stat panel)
+from(bucket: "metrics_prometheus")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> last()
+  |> group(columns: ["instance_type"])
+  |> count()
+```
+
+### 2. Per-Application Dashboard
+
+```flux
+// TX throughput per app (stacked area — top talkers)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["app"] != "" and r["app"] != "system")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["app"])
+  |> sum()
+
+// RX throughput per app
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> filter(fn: (r) => r["app"] != "" and r["app"] != "system")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["app"])
+  |> sum()
+
+// Total bytes transferred per app (bar chart — last 24h)
+from(bucket: "metrics_prometheus")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["app"] != "" and r["app"] != "system")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> group(columns: ["app"])
+  |> sum()
+  |> group()
+  |> sort(columns: ["_value"], desc: true)
+```
+
+### 3. Docker Containers Dashboard
+
+```flux
+// TX throughput per Docker container
 from(bucket: "metrics_prometheus")
   |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
   |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
   |> filter(fn: (r) => r["instance_type"] == "docker")
-  |> filter(fn: (r) => r["app"] != "")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// Per-container packets/s
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_packets_total" or r["_field"] == "net_interface_rx_packets_total")
+  |> filter(fn: (r) => r["instance_type"] == "docker")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// Docker containers grouped by app with RX+TX combined
+import "join"
+
+rx = from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "docker")
   |> derivative(unit: 1s, nonNegative: true)
   |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
   |> group(columns: ["app"])
+  |> sum()
+  |> set(key: "direction", value: "rx")
+
+tx = from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "docker")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["app"])
+  |> sum()
+  |> set(key: "direction", value: "tx")
+
+union(tables: [rx, tx])
+```
+
+### 4. Virtual Machines Dashboard
+
+```flux
+// TX throughput per VM
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "vm" or r["instance_type"] == "macvtap")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["instance"])
   |> sum()
 
 // RX throughput per VM
@@ -387,9 +568,196 @@ from(bucket: "metrics_prometheus")
   |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
   |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
-  |> filter(fn: (r) => r["instance_type"] == "vm")
+  |> filter(fn: (r) => r["instance_type"] == "vm" or r["instance_type"] == "macvtap")
   |> derivative(unit: 1s, nonNegative: true)
   |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["instance"])
+  |> sum()
+
+// VM packets/s per VM
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_packets_total")
+  |> filter(fn: (r) => r["instance_type"] == "vm" or r["instance_type"] == "macvtap")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["instance"])
+  |> sum()
+
+// VMs by VLAN (table panel)
+from(bucket: "metrics_prometheus")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "vm")
+  |> last()
+  |> keep(columns: ["instance", "interface", "bridge", "vlan", "state"])
+```
+
+### 5. Incus/LXC Containers Dashboard
+
+```flux
+// TX throughput per Incus container
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "incus")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// RX throughput per Incus container
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "incus")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+```
+
+### 6. Bridge & VLAN Dashboard
+
+```flux
+// TX throughput per bridge
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "bridge")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// Traffic per VLAN (sum all members)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["vlan"] != "")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["vlan"])
+  |> sum()
+
+// Bridge member count (stat panel)
+from(bucket: "metrics_prometheus")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> filter(fn: (r) => r["bridge"] != "")
+  |> last()
+  |> group(columns: ["bridge"])
+  |> count()
+
+// All interfaces on a specific VLAN
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["vlan"] == "1")  // change VLAN ID as needed
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+```
+
+### 7. Physical NICs Dashboard
+
+```flux
+// TX throughput per physical NIC
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "physical")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// RX throughput per physical NIC
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "physical")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// Physical NIC utilization % (assuming 10Gbps = 1250000000 bytes/s)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_bytes_total")
+  |> filter(fn: (r) => r["instance_type"] == "physical")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> map(fn: (r) => ({r with _value: r._value / 1250000000.0 * 100.0}))
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+```
+
+### 8. Errors & Drops Dashboard
+
+```flux
+// RX errors per interface
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_errors_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> filter(fn: (r) => r._value > 0)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// TX errors per interface
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_errors_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> filter(fn: (r) => r._value > 0)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// RX drops per interface
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_dropped_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> filter(fn: (r) => r._value > 0)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// TX drops per interface
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_tx_dropped_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> filter(fn: (r) => r._value > 0)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+
+// Combined errors+drops per app (alert-worthy)
+from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_errors_total"
+                     or r["_field"] == "net_interface_tx_errors_total"
+                     or r["_field"] == "net_interface_rx_dropped_total"
+                     or r["_field"] == "net_interface_tx_dropped_total")
+  |> derivative(unit: 1s, nonNegative: true)
+  |> filter(fn: (r) => r._value > 0)
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["app"])
+  |> sum()
+```
+
+### 9. Master Inventory Table
+
+```flux
+// Full interface inventory (table panel)
+from(bucket: "metrics_prometheus")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["_measurement"] == "truenas_netexporter")
+  |> filter(fn: (r) => r["_field"] == "net_interface_rx_bytes_total")
+  |> last()
+  |> keep(columns: ["interface", "instance", "instance_type", "app", "bridge", "vlan", "state", "_value"])
+  |> rename(columns: {_value: "rx_bytes_total"})
+  |> sort(columns: ["instance_type", "app", "instance"])
 ```
 
 ---
