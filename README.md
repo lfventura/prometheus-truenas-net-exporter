@@ -24,6 +24,7 @@ On a TrueNAS SCALE system, a single host can have 40+ network interfaces: physic
 - Derives `app` label for bridges and orphan veths from their Docker network name
 - Discovers 802.1Q VLANs from `/proc/net/vlan/config` and propagates VLAN IDs to bridges and their members
 - Classifies all interfaces: `physical`, `bridge`, `docker`, `incus`, `vm`, `vlan`, `macvtap`, `loopback`
+- Exports `truenas_docker_container_info` (short ID → container and app name), so dashboards can name the per-container CPU, memory and disk charts of TrueNAS reporting, which are keyed by ID
 
 ## Metrics
 
@@ -99,7 +100,11 @@ truenas_docker_container_info{app="jellyfin",id="795d18598fc4",name="ix-jellyfin
 ```
 
 The ID changes whenever the container is recreated (for example on an app update). Keep the info
-series in storage with the rest of the data, so older IDs still resolve to a name.
+series in storage with the rest of the data, so older IDs still resolve to a name. IDs of containers
+that were gone before the exporter first saw them have no info series and stay as IDs.
+
+When TrueNAS reporting and this exporter write to different InfluxDB buckets, the Grafana datasource
+that runs the joined query needs a token with read access to both buckets.
 
 Flux example, for TrueNAS reporting data sent to InfluxDB by its Graphite exporter:
 
@@ -360,7 +365,7 @@ Running inside Docker requires specific privileges to access host data:
 | `pid: host` | Access `/proc/<PID>/root/sys` for container sysfs, `/proc/<PID>/fdinfo` for QEMU FDs |
 | `privileged: true` | Read `/proc/<PID>/fdinfo/` (requires `CAP_SYS_PTRACE`), `chroot /host` for `midclt` |
 | `/:/host:ro,rslave` | Host filesystem access for sysfs, procfs, and `chroot` |
-| `/var/run/docker.sock` | Docker Engine API for container/network listing |
+| `/var/run/docker.sock` | Docker Engine API for container/network listing and `truenas_docker_container_info` |
 | `--path.procfs=/host/proc` | Tell exporter where host procfs is mounted |
 | `--path.rootfs=/host` | Tell exporter where host rootfs is (for `chroot` commands) |
 | `--docker.socket=/host/var/run/docker.sock` | Docker socket inside container |
@@ -371,10 +376,14 @@ Running inside Docker requires specific privileges to access host data:
 
 ### Docker Compose (Custom App)
 
+Apps → Discover → Custom App → Install via YAML. The same file is in the repository as
+`docker-compose.yml`. Pin a release tag (see the releases page) instead of `latest`, so updates are
+deliberate.
+
 ```yaml
 services:
   truenas-net-exporter:
-    image: ghcr.io/lfventura/prometheus-truenas-net-exporter:latest
+    image: ghcr.io/lfventura/prometheus-truenas-net-exporter:v0.6.0
     container_name: truenas_net_exporter
     pid: host
     privileged: true
