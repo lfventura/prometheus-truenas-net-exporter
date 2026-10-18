@@ -40,7 +40,7 @@ On a TrueNAS SCALE system, a single host can have 40+ network interfaces: physic
 | `net_interface_rx_dropped_total` | Total received packets dropped |
 | `net_interface_tx_dropped_total` | Total transmitted packets dropped |
 
-All metrics are counters. Use `rate()` or `derivative()` for throughput.
+All `net_interface_*` metrics are counters. Use `rate()` or `derivative()` for throughput.
 
 ### Labels
 
@@ -83,6 +83,47 @@ net_interface_rx_bytes_total{interface="vlan10",instance="vlan10",instance_type=
 ```
 
 ---
+
+### Container info (from the Docker Engine API)
+
+| Metric | Labels | Description |
+|---|---|---|
+| `truenas_docker_container_info` | `id`, `name`, `app` | One series per running container, always 1 |
+
+`id` is the 12-character short container ID, the same one TrueNAS reporting (netdata) uses in
+per-container cgroup charts such as `cgroup_795d18598fc4`. Join on it to show container and app
+names for CPU, memory and disk data keyed by ID:
+
+```
+truenas_docker_container_info{app="jellyfin",id="795d18598fc4",name="ix-jellyfin-jellyfin-1"} 1
+```
+
+The ID changes whenever the container is recreated (for example on an app update). Keep the info
+series in storage with the rest of the data, so older IDs still resolve to a name.
+
+Flux example, for TrueNAS reporting data sent to InfluxDB by its Graphite exporter:
+
+```flux
+import "join"
+import "strings"
+
+names = from(bucket: "metrics_prometheus")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_field"] == "truenas_docker_container_info")
+  |> group(columns: ["id"])
+  |> last()
+  |> group()
+  |> keep(columns: ["id", "app"])
+
+from(bucket: "metrics_graphite")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] =~ /^cgroup_/ and r["type"] == "mem_usage" and r["_field"] == "ram")
+  |> map(fn: (r) => ({r with id: strings.trimPrefix(v: r._measurement, prefix: "cgroup_")}))
+  |> group()
+  |> join.left(right: names, on: (l, r) => l.id == r.id,
+       as: (l, r) => ({l with app: if exists r.app then r.app else l._measurement}))
+  |> group(columns: ["app"])
+```
 
 ## How It Works — Technical Deep Dive
 

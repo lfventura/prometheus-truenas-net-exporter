@@ -99,6 +99,39 @@ func (c *DockerClient) ListContainers() ([]ContainerInfo, error) {
 	return result, nil
 }
 
+// ListContainerSummaries returns the ID, name and labels of all running containers
+// from a single list call, without inspecting each one.
+func (c *DockerClient) ListContainerSummaries() ([]ContainerInfo, error) {
+	resp, err := c.httpClient.Get("http://localhost/containers/json")
+	if err != nil {
+		return nil, fmt.Errorf("docker list containers: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("docker read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("docker API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var containers []dockerContainerListEntry
+	if err := json.Unmarshal(body, &containers); err != nil {
+		return nil, fmt.Errorf("docker unmarshal list: %w", err)
+	}
+
+	result := make([]ContainerInfo, 0, len(containers))
+	for _, c2 := range containers {
+		name := ""
+		if len(c2.Names) > 0 {
+			name = strings.TrimPrefix(c2.Names[0], "/")
+		}
+		result = append(result, ContainerInfo{ID: c2.ID, Name: name, Labels: c2.Labels})
+	}
+	return result, nil
+}
+
 // inspectContainer retrieves full container details via the inspect API.
 func (c *DockerClient) inspectContainer(id string) (ContainerInfo, error) {
 	resp, err := c.httpClient.Get(fmt.Sprintf("http://localhost/containers/%s/json", id))
@@ -174,8 +207,9 @@ func isNumeric(s string) bool {
 // -- internal JSON types matching the Docker API response --
 
 type dockerContainerListEntry struct {
-	ID    string `json:"Id"`
-	Names []string
+	ID     string `json:"Id"`
+	Names  []string
+	Labels map[string]string
 }
 
 type dockerInspectResponse struct {

@@ -66,6 +66,7 @@ func main() {
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 		collector.NewNetworkCollector(logger, opts, *dockerSocket),
+		collector.NewContainerCollector(logger, *dockerSocket),
 	)
 
 	http.Handle(*metricsPath, promhttp.HandlerFor(reg, promhttp.HandlerOpts{
