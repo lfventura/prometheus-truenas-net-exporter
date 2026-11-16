@@ -13,16 +13,16 @@ const shortIDLength = 12
 // ContainerCollector exports one info series per running Docker container, mapping its short ID
 // to its name and application. Dashboards join on it to show app names for data keyed by ID.
 type ContainerCollector struct {
-	dockerSocket string
-	logger       *slog.Logger
-	info         *prometheus.Desc
+	docker *DockerClient
+	logger *slog.Logger
+	info   *prometheus.Desc
 }
 
 // NewContainerCollector creates a ContainerCollector that reads containers from the Docker socket.
 func NewContainerCollector(logger *slog.Logger, dockerSocket string) *ContainerCollector {
 	return &ContainerCollector{
-		dockerSocket: dockerSocket,
-		logger:       logger,
+		docker: NewDockerClient(dockerSocket),
+		logger: logger,
 		info: prometheus.NewDesc(
 			"truenas_docker_container_info",
 			"Running Docker container, always 1. id is the 12-character short ID used in cgroup chart names.",
@@ -38,7 +38,7 @@ func (c *ContainerCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect implements prometheus.Collector.
 func (c *ContainerCollector) Collect(ch chan<- prometheus.Metric) {
-	containers, err := NewDockerClient(c.dockerSocket).ListContainerSummaries()
+	containers, err := c.docker.ListContainerSummaries()
 	if err != nil {
 		c.logger.Debug("docker unavailable, skipping container info", "error", err)
 		return

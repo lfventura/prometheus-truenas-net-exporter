@@ -41,10 +41,15 @@ type ContainerNetwork struct {
 // The socketPath should be the absolute path on the host (e.g. /var/run/docker.sock)
 // or the container-mapped path (e.g. /host/var/run/docker.sock).
 func NewDockerClient(socketPath string) *DockerClient {
+	// One client per collector, reused across scrapes: a Transport created per scrape keeps its
+	// idle keep-alive connection (one fd and two goroutines) open forever once it is dropped.
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return net.DialTimeout("unix", socketPath, 5*time.Second)
 		},
+		MaxIdleConns:        2,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     90 * time.Second,
 	}
 	return &DockerClient{
 		socketPath: socketPath,

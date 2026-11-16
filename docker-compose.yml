@@ -1,6 +1,6 @@
 services:
   truenas-net-exporter:
-    image: ghcr.io/lfventura/prometheus-truenas-net-exporter:v0.6.0
+    image: ghcr.io/lfventura/prometheus-truenas-net-exporter:v0.6.1
     container_name: truenas_net_exporter
     # Use the host PID namespace so we can read /proc/<PID>/root/sys for container mapping.
     pid: host

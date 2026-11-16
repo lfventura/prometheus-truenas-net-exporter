@@ -28,9 +28,9 @@ type NetworkCollector struct {
 	rxDropped *prometheus.Desc
 	txDropped *prometheus.Desc
 
-	opts         Options
-	dockerSocket string
-	logger       *slog.Logger
+	opts   Options
+	docker *DockerClient
+	logger *slog.Logger
 }
 
 // interfaceInfo contains resolved metadata for one network interface.
@@ -62,9 +62,9 @@ func NewNetworkCollector(logger *slog.Logger, opts Options, dockerSocket string)
 	labels := []string{"interface", "instance", "instance_type", "app", "bridge", "vlan", "state"}
 
 	return &NetworkCollector{
-		opts:         opts,
-		dockerSocket: dockerSocket,
-		logger:       logger,
+		opts:   opts,
+		docker: NewDockerClient(dockerSocket),
+		logger: logger,
 		rxBytes: prometheus.NewDesc(
 			"net_interface_rx_bytes_total",
 			"Total bytes received on this interface.",
@@ -463,7 +463,7 @@ func (c *NetworkCollector) fetchDockerData(ifindexMap map[int]string) (map[strin
 	vethMap := make(map[string]ContainerInfo)
 	netMap := make(map[string]DockerNetworkInfo)
 
-	client := NewDockerClient(c.dockerSocket)
+	client := c.docker
 	if !client.Available() {
 		c.logger.Debug("docker socket not available, skipping container/network mapping")
 		return vethMap, netMap
