@@ -383,7 +383,7 @@ deliberate.
 ```yaml
 services:
   truenas-net-exporter:
-    image: ghcr.io/lfventura/prometheus-truenas-net-exporter:v0.6.0
+    image: ghcr.io/lfventura/prometheus-truenas-net-exporter:v0.6.1
     container_name: truenas_net_exporter
     pid: host
     privileged: true
